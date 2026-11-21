@@ -28,7 +28,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
-          tag="${INPUT_TAG:-$(gh api repos/ghostty-org/ghostty/releases/latest --jq .tag_name)}"
+          # Ghostty publishes versions as tags (vX.Y.Z), not GitHub releases.
+          latest=$(git ls-remote --tags --refs https://github.com/ghostty-org/ghostty.git 'v*' \
+            | awk -F/ '{print $3}' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          tag="${INPUT_TAG:-$latest}"
+          [ -n "$tag" ] || { echo "no upstream tag found"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if gh release view "$tag-single-tab-bar" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "build=false" >> "$GITHUB_OUTPUT"; echo "$tag is already built"
