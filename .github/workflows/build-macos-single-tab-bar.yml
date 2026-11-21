@@ -29,8 +29,11 @@ jobs:
         with:
           version: 0.17.0
 
+      - name: Install pandoc
+        run: brew install pandoc
+
       - name: Build GhosttyKit
-        run: zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Dversion-string=1.4.0
+        run: zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Demit-docs=true -Dversion-string=1.4.0
 
       - name: Build Ghostty.app
         run: |
