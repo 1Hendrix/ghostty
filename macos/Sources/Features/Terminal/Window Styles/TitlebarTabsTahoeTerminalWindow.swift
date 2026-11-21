@@ -152,24 +152,46 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
     }
 
     /// Hide the toolbar and titlebar while this window is the only tab, and bring them back
-    /// once a second tab exists. Safe to call repeatedly.
+    /// once a second tab exists. Safe to call repeatedly: AppKit restores parts of the
+    /// titlebar on its own (title changes, fullscreen exit, tab changes), so every call
+    /// re-asserts the wanted state.
     func updateSingleTabChrome(forceShow: Bool = false) {
         let hide = !forceShow && isSingleTab
+        let isFullscreen = styleMask.contains(.fullScreen)
 
-        guard hide != singleTabChromeHidden else {
-            // AppKit sometimes brings the titlebar back (title changes, fullscreen exit).
-            if hide, let titlebarContainer, !titlebarContainer.isHidden {
-                titlebarContainer.isHidden = true
-            }
-            return
+        if hide != singleTabChromeHidden {
+            willChangeValue(forKey: "contentLayoutRect")
+            singleTabChromeHidden = hide
+            if !hide { titlebarContainer?.isHidden = false }
+            toolbar?.isVisible = !hide
+            didChangeValue(forKey: "contentLayoutRect")
         }
 
-        singleTabChromeHidden = hide
-        willChangeValue(forKey: "contentLayoutRect")
-        toolbar?.isVisible = !hide
-        titlebarContainer?.isHidden = hide
-        didChangeValue(forKey: "contentLayoutRect")
-        terminalController?.extendsIntoTitlebar = hide
+        // Let the content extend under the titlebar area while it is hidden, like the
+        // hidden titlebar style. Style mask changes are left alone in fullscreen.
+        if !isFullscreen {
+            if hide && !styleMask.contains(.fullSizeContentView) {
+                styleMask.insert(.fullSizeContentView)
+            } else if !hide && styleMask.contains(.fullSizeContentView) {
+                styleMask.remove(.fullSizeContentView)
+            }
+        }
+
+        if hide, let titlebarContainer, !titlebarContainer.isHidden {
+            titlebarContainer.isHidden = true
+        }
+
+        // macOS 27 moves an NSScrollPocket into the titlebar area that would cover the
+        // first terminal row (same fix as the hidden titlebar style).
+        if #available(macOS 27, *),
+           let themeFrame = contentView?.superview,
+           let scrollPocket = themeFrame.firstDescendant(withClassName: "NSScrollPocket") {
+            scrollPocket.isHidden = hide
+        }
+
+        if let terminalController, terminalController.extendsIntoTitlebar != hide {
+            terminalController.extendsIntoTitlebar = hide
+        }
         contentView?.needsLayout = true
     }
 
