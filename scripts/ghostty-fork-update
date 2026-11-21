@@ -1,0 +1,157 @@
+#!/bin/bash
+# ghostty-fork-update: install the patched Ghostty (single-tab-bar) from github.com/1Hendrix/ghostty
+#
+#   ghostty-fork-update              newest release of the fork
+#   ghostty-fork-update --tag TAG    a specific fork release, e.g. v1.4.0-single-tab-bar
+#   ghostty-fork-update --run ID     the build artifact of one GitHub Actions run
+#   ghostty-fork-update --permissions   open the macOS permission panes to re-grant Ghostty
+#
+# Downloads the build, signs it with "Ghostty Fork Signing (1Hendrix)" from the login
+# keychain, and stages it. The swap into /Applications/Ghostty.app happens by itself as
+# soon as Ghostty is quit (right away if it isn't running), then Ghostty is reopened.
+# The app being replaced is kept: "Ghostty (official <version>).app" the first time,
+# "Ghostty (previous).app" after that. Log: ~/Library/Logs/ghostty-fork-update.log
+set -euo pipefail
+
+REPO="1Hendrix/ghostty"
+ARTIFACT="ghostty-single-tab-bar"
+IDENTITY="Ghostty Fork Signing (1Hendrix)"
+ENTITLEMENTS="$HOME/.config/ghostty-fork/Ghostty.entitlements"
+WORK="$HOME/Library/Caches/ghostty-fork"
+STAGED="$WORK/staged/Ghostty.app"
+LOG="$HOME/Library/Logs/ghostty-fork-update.log"
+APP="/Applications/Ghostty.app"
+BREW="/opt/homebrew/bin/brew"
+PB="/usr/libexec/PlistBuddy"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
+
+# pgrep misses the running Ghostty on this Mac; ps lists every process with its full path.
+# Read the whole list first: with pipefail, "ps | grep -q" reports failure when grep
+# stops early on a match (ps dies of SIGPIPE), which reads as "not running".
+ghostty_running() {
+  local procs
+  procs=$(/bin/ps -axo comm=)
+  grep -qxF "$APP/Contents/MacOS/ghostty" <<<"$procs"
+}
+
+# ---------------------------------------------------------------- swap (detached)
+swap() {
+  log "swap: waiting for Ghostty to quit"
+  for _ in $(seq 1 14400); do ghostty_running || break; sleep 3; done
+  if ghostty_running; then log "swap: Ghostty still running after 12 h, giving up (staged build kept)"; exit 1; fi
+  [ -d "$STAGED" ] || { log "swap: nothing staged"; exit 1; }
+
+  if [ -d "$APP" ]; then
+    if [ "$($PB -c 'Print :GhosttyFork' "$APP/Contents/Info.plist" 2>/dev/null || true)" = "single-tab-bar" ]; then
+      backup="/Applications/Ghostty (previous).app"
+    else
+      ver=$($PB -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo unknown)
+      backup="/Applications/Ghostty (official $ver).app"
+    fi
+    rm -rf "$backup"
+    ditto "$APP" "$backup"
+    log "swap: kept the old app as $backup"
+  fi
+
+  # Hand Ghostty over from Homebrew to the fork (plain uninstall, never --zap: config stays).
+  if [ -x "$BREW" ] && "$BREW" list --cask ghostty >/dev/null 2>&1; then
+    "$BREW" uninstall --cask ghostty >>"$LOG" 2>&1 && log "swap: removed the Homebrew cask"
+  fi
+
+  rm -rf "$APP"
+  ditto "$STAGED" "$APP"
+  rm -rf "$WORK/staged"
+
+  # The man pages and shell completions the cask used to link.
+  R="$APP/Contents/Resources"
+  ln -sf "$R/man/man1/ghostty.1" /opt/homebrew/share/man/man1/ghostty.1 2>/dev/null || true
+  ln -sf "$R/man/man5/ghostty.5" /opt/homebrew/share/man/man5/ghostty.5 2>/dev/null || true
+  ln -sf "$R/zsh/site-functions/_ghostty" /opt/homebrew/share/zsh/site-functions/_ghostty 2>/dev/null || true
+  ln -sf "$R/bash-completion/completions/ghostty.bash" /opt/homebrew/etc/bash_completion.d/ghostty 2>/dev/null || true
+  ln -sf "$R/fish/vendor_completions.d/ghostty.fish" /opt/homebrew/share/fish/vendor_completions.d/ghostty.fish 2>/dev/null || true
+
+  log "swap: installed $($PB -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+  # Open with a clean environment so nothing from the calling shell leaks into Ghostty.
+  env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/open -a "$APP"
+  /usr/bin/osascript -e 'display notification "Patched Ghostty is installed. Run ghostty-fork-update --permissions once." with title "Ghostty"' >/dev/null 2>&1 || true
+}
+
+# A new signature means macOS asks again for the permissions the old Ghostty had.
+permissions() {
+  echo "Re-grant Ghostty in each pane (remove the old Ghostty entry with -, add /Applications/Ghostty.app with +):"
+  echo "  Accessibility  - needed for the global hotkey (cmd+shift+space quick terminal)"
+  echo "  Full Disk Access"
+  echo "  Screen & System Audio Recording"
+  for pane in Privacy_Accessibility Privacy_AllFiles Privacy_ScreenCapture; do
+    /usr/bin/open "x-apple.systempreferences:com.apple.preference.security?$pane"; sleep 1
+  done
+}
+
+if [ "${1:-}" = "--swap" ]; then swap; exit 0; fi
+if [ "${1:-}" = "--permissions" ]; then permissions; exit 0; fi
+
+# ---------------------------------------------------------------- fetch + sign + stage
+mode="release"; ref=""
+case "${1:-}" in
+  --run) mode="run"; ref="${2:?run id}";;
+  --tag) ref="${2:?tag}";;
+  "") ;;
+  *) sed -n '2,14p' "$0"; exit 2;;
+esac
+
+security find-identity -v -p codesigning | grep -q "$IDENTITY" || { echo "signing identity '$IDENTITY' missing from the login keychain"; exit 1; }
+[ -f "$ENTITLEMENTS" ] || { echo "missing $ENTITLEMENTS"; exit 1; }
+
+case "$WORK" in "$HOME"/Library/Caches/ghostty-fork) ;; *) echo "bad WORK"; exit 1;; esac
+rm -rf "$WORK/dl"; mkdir -p "$WORK/dl" "$WORK/staged"
+if [ "$mode" = "run" ]; then
+  gh run download "$ref" -R "$REPO" -n "$ARTIFACT" -D "$WORK/dl"
+  log "fetch: run $ref"
+else
+  gh release download ${ref:+"$ref"} -R "$REPO" -p '*.zip' -D "$WORK/dl"
+  log "fetch: release ${ref:-latest}"
+fi
+zip=$(ls "$WORK/dl"/*.zip | head -1)
+ditto -x -k "$zip" "$WORK/dl"
+A="$WORK/dl/Ghostty.app"; P="$A/Contents/Info.plist"
+[ -d "$A" ] || { echo "no Ghostty.app in the download"; exit 1; }
+
+# No Sparkle updates from upstream: they would put the unpatched app back.
+$PB -c "Delete :SUFeedURL" "$P" 2>/dev/null || true
+$PB -c "Set :SUEnableAutomaticChecks false" "$P" 2>/dev/null || $PB -c "Add :SUEnableAutomaticChecks bool false" "$P"
+$PB -c "Set :GhosttyFork single-tab-bar" "$P" 2>/dev/null || $PB -c "Add :GhosttyFork string single-tab-bar" "$P"
+# Xcode leaves the placeholder version 0.1; take the real one from the binary.
+if [ "$($PB -c 'Print :CFBundleShortVersionString' "$P")" = "0.1" ]; then
+  v=$("$A/Contents/MacOS/ghostty" +version 2>/dev/null | awk '/^Ghostty /{print $2; exit}')
+  [ -n "$v" ] && $PB -c "Set :CFBundleShortVersionString $v" "$P"
+fi
+
+# Sign inside-out, like Ghostty's own release, with our stable identity.
+S="$A/Contents/Frameworks/Sparkle.framework/Versions/B"
+for p in "$S/XPCServices/Downloader.xpc" "$S/XPCServices/Installer.xpc" "$S/Autoupdate" "$S/Updater.app" \
+         "$A/Contents/Frameworks/Sparkle.framework" "$A/Contents/PlugIns/DockTilePlugin.plugin"; do
+  if [ -e "$p" ]; then codesign --force --sign "$IDENTITY" "$p" >/dev/null; fi
+done
+# No hardened runtime: it is only needed for Apple notarization, and with a self-signed
+# identity (no Team ID) its library validation refuses to load Sparkle.
+codesign --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" "$A" >/dev/null
+codesign --verify --deep --strict "$A"
+log "sign: ok ($(codesign -dvv "$A" 2>&1 | grep -m1 Authority))"
+
+"$A/Contents/MacOS/ghostty" +version >/dev/null 2>&1 || { log "sign: signed app does not start"; exit 1; }
+rm -rf "$STAGED"; ditto "$A" "$STAGED"; rm -rf "$WORK/dl"
+log "stage: $($PB -c 'Print :CFBundleShortVersionString' "$STAGED/Contents/Info.plist") staged"
+
+# Refuse to stage a build that cannot start.
+"$STAGED/Contents/MacOS/ghostty" +version >/dev/null 2>&1 || { log "stage: staged app does not start"; rm -rf "$STAGED"; exit 1; }
+
+[ "${GHOSTTY_FORK_STAGE_ONLY:-}" = "1" ] && { echo "Staged only (no swap armed)."; exit 0; }
+
+# Detached swapper: survives this terminal and Ghostty quitting.
+/usr/bin/python3 -c 'import subprocess,sys; subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)' "$0" --swap
+if ghostty_running; then
+  echo "Staged. Quit Ghostty (⌘Q) when it suits you; the new version installs and reopens by itself."
+else
+  echo "Installing now."
+fi

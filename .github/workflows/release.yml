@@ -1,0 +1,121 @@
+# Daily: when Ghostty publishes a release, apply patches/single-tab-bar.patch to it,
+# build Ghostty.app (unsigned; it is signed on the Mac by ghostty-fork-update) and
+# publish it as a release of this fork. An issue in this repo tells the owner.
+name: Track Ghostty releases
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (default: latest release)"
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+      build: ${{ steps.t.outputs.build }}
+    steps:
+      - id: t
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${INPUT_TAG:-$(gh api repos/ghostty-org/ghostty/releases/latest --jq .tag_name)}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag-single-tab-bar" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"; echo "$tag is already built"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "$tag needs a build"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 120
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout Ghostty ${{ env.TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: ghostty-org/ghostty
+          ref: ${{ env.TAG }}
+          path: ghostty
+
+      - name: Checkout fork tools
+        uses: actions/checkout@v4
+        with:
+          path: fork
+
+      - name: Apply the single-tab-bar patch
+        id: patch
+        run: git -C ghostty apply "$GITHUB_WORKSPACE/fork/patches/single-tab-bar.patch"
+
+      - name: Select the newest Xcode
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Using $X"; sudo xcode-select -s "$X"; xcodebuild -version
+
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Zig version
+        id: zig
+        run: echo "version=$(sed -n 's/.*minimum_zig_version = "\(.*\)".*/\1/p' ghostty/build.zig.zon)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+
+      - name: Build GhosttyKit
+        working-directory: ghostty
+        run: zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Dversion-string=${TAG#v}
+
+      - name: Build Ghostty.app
+        working-directory: ghostty/macos
+        run: |
+          xcodebuild -target Ghostty -configuration Release \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${TAG#v}" build/Release/Ghostty.app/Contents/Info.plist
+
+      - name: Publish release
+        run: |
+          cd ghostty/macos/build/Release
+          ditto -c -k --keepParent Ghostty.app "$GITHUB_WORKSPACE/Ghostty-$TAG-single-tab-bar.zip"
+          cd "$GITHUB_WORKSPACE"
+          gh release create "$TAG-single-tab-bar" "Ghostty-$TAG-single-tab-bar.zip" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Ghostty ${TAG#v} + single-tab-bar" \
+            --notes "Ghostty $TAG with the single-tab-bar patch (no bar while a window has one tab). Install: ghostty-fork-update"
+          gh issue create -R "$GITHUB_REPOSITORY" --title "Ghostty ${TAG#v} (patched) is ready" \
+            --body "Run \`ghostty-fork-update\` on the Mac, then quit Ghostty when it suits you."
+
+      - name: Report a patch that no longer applies
+        if: failure() && steps.patch.outcome == 'failure'
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" --title "single-tab-bar patch does not apply to Ghostty $TAG" \
+            --body "Upstream changed the patched files. The patch in patches/single-tab-bar.patch needs updating before $TAG can be built."
+
+  # Scheduled workflows stop after 60 days without repository activity; a small commit
+  # every ~50 days keeps this one running.
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 50 * 86400 )) ]; then
+            date -u +%F > .github/keepalive
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .github/keepalive && git commit -m "keepalive" && git push
+          fi

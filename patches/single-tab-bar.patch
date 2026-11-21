@@ -1,0 +1,164 @@
+diff --git a/macos/Sources/Features/Terminal/BaseTerminalController.swift b/macos/Sources/Features/Terminal/BaseTerminalController.swift
+index 79ca5b6..e45f24a 100644
+--- a/macos/Sources/Features/Terminal/BaseTerminalController.swift
++++ b/macos/Sources/Features/Terminal/BaseTerminalController.swift
+@@ -56,6 +56,10 @@ class BaseTerminalController: NSWindowController,
+     /// This can be set to show/hide the command palette.
+     @Published var commandPaletteIsShowing: Bool = false
+ 
++    /// True while the window hides its titlebar because it holds a single tab
++    /// (fork patch: single-tab-bar). The terminal then extends into the titlebar area.
++    @Published var extendsIntoTitlebar: Bool = false
++
+     /// Set if the terminal view should show the update overlay.
+     @Published var updateOverlayIsVisible: Bool = false
+ 
+diff --git a/macos/Sources/Features/Terminal/TerminalView.swift b/macos/Sources/Features/Terminal/TerminalView.swift
+index b6e1c63..853319f 100644
+--- a/macos/Sources/Features/Terminal/TerminalView.swift
++++ b/macos/Sources/Features/Terminal/TerminalView.swift
+@@ -35,6 +35,9 @@ protocol TerminalViewModel: ObservableObject {
+ 
+     /// The update overlay should be visible.
+     var updateOverlayIsVisible: Bool { get }
++
++    /// The terminal should extend up into the (hidden) titlebar area.
++    var extendsIntoTitlebar: Bool { get }
+ }
+ 
+ /// The main terminal view. This terminal view supports splits.
+@@ -105,7 +108,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
+                                idealHeight: lastFocusedSurface?.value?.initialSize?.height)
+                 }
+                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
+-                .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
++                .ignoresSafeArea(.container, edges: (ghostty.config.macosTitlebarStyle == .hidden || viewModel.extendsIntoTitlebar) ? .top : [])
+ 
+                 if let surfaceView = lastFocusedSurface?.value {
+                     TerminalCommandPaletteView(
+diff --git a/macos/Sources/Features/Terminal/Window Styles/TitlebarTabsTahoeTerminalWindow.swift b/macos/Sources/Features/Terminal/Window Styles/TitlebarTabsTahoeTerminalWindow.swift
+index cf45e5e..637f921 100644
+--- a/macos/Sources/Features/Terminal/Window Styles/TitlebarTabsTahoeTerminalWindow.swift	
++++ b/macos/Sources/Features/Terminal/Window Styles/TitlebarTabsTahoeTerminalWindow.swift	
+@@ -33,6 +33,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
+             DispatchQueue.main.async { [weak self] in
+                 guard let self else { return }
+                 self.viewModel.title = self.title
++                self.updateSingleTabChrome()
+             }
+         }
+     }
+@@ -50,10 +51,16 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
+         toolbar.centeredItemIdentifiers.insert(.title)
+         self.toolbar = toolbar
+         toolbarStyle = .unifiedCompact
++
++        // Fork patch (single-tab-bar): start without a bar; a second tab brings it back.
++        DispatchQueue.main.async { [weak self] in
++            self?.updateSingleTabChrome()
++        }
+     }
+     // Called after new tab finishes adjusting and setupTabBar is called in order to prevent Tab Bar hiding/size bug that occurs with some interactions with Mac UI
+     override func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
+         super.syncAppearance(surfaceConfig)
++        updateSingleTabChrome()
+         DispatchQueue.main.async {
+             // HACK: wait a tick before doing anything, to avoid edge cases during startup... :/
+             // If we don't do this then on launch windows with restored state with tabs will end
+@@ -65,6 +72,8 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
+     override func becomeMain() {
+         super.becomeMain()
+ 
++        updateSingleTabChrome()
++
+         // Check if we have a tab bar and set it up if we have to. See the comment
+         // on this function to learn why we need to check this here.
+         setupTabBar()
+@@ -95,6 +104,10 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
+         // to put tab bar where we want again
+         tabBarObserver = nil
+ 
++        // Fork patch (single-tab-bar): the tab bar lives in the toolbar, so the
++        // toolbar must be visible before the tab bar is set up.
++        updateSingleTabChrome(forceShow: true)
++
+         // Some setup needs to happen BEFORE it is added, such as layout. If
+         // we don't do this before the call below, we'll trigger an AppKit
+         // assertion.
+@@ -121,6 +134,76 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
+         super.removeTitlebarAccessoryViewController(at: index)
+ 
+         removeTabBar()
++
++        // Fork patch (single-tab-bar): back to one tab hides the bar again.
++        DispatchQueue.main.async { [weak self] in
++            self?.updateSingleTabChrome()
++        }
++    }
++
++    // MARK: Single Tab Bar (fork patch: single-tab-bar)
++
++    /// True while the toolbar and titlebar are hidden because this window is its only tab.
++    private var singleTabChromeHidden = false
++
++    /// A window with no tab group, or a tab group of one, is a single tab.
++    private var isSingleTab: Bool {
++        (tabGroup?.windows.count ?? 1) <= 1
++    }
++
++    /// Hide the toolbar and titlebar while this window is the only tab, and bring them back
++    /// once a second tab exists. Safe to call repeatedly: AppKit restores parts of the
++    /// titlebar on its own (title changes, fullscreen exit, tab changes), so every call
++    /// re-asserts the wanted state.
++    func updateSingleTabChrome(forceShow: Bool = false) {
++        let hide = !forceShow && isSingleTab
++        let isFullscreen = styleMask.contains(.fullScreen)
++
++        if hide != singleTabChromeHidden {
++            willChangeValue(forKey: "contentLayoutRect")
++            singleTabChromeHidden = hide
++            if !hide { titlebarContainer?.isHidden = false }
++            toolbar?.isVisible = !hide
++            didChangeValue(forKey: "contentLayoutRect")
++        }
++
++        // Let the content extend under the titlebar area while it is hidden, like the
++        // hidden titlebar style. Style mask changes are left alone in fullscreen.
++        if !isFullscreen {
++            if hide && !styleMask.contains(.fullSizeContentView) {
++                styleMask.insert(.fullSizeContentView)
++            } else if !hide && styleMask.contains(.fullSizeContentView) {
++                styleMask.remove(.fullSizeContentView)
++            }
++        }
++
++        if hide, let titlebarContainer, !titlebarContainer.isHidden {
++            titlebarContainer.isHidden = true
++        }
++
++        // macOS 27 moves an NSScrollPocket into the titlebar area that would cover the
++        // first terminal row (same fix as the hidden titlebar style).
++        if #available(macOS 27, *),
++           let themeFrame = contentView?.superview,
++           let scrollPocket = themeFrame.firstDescendant(withClassName: "NSScrollPocket") {
++            scrollPocket.isHidden = hide
++        }
++
++        if let terminalController, terminalController.extendsIntoTitlebar != hide {
++            terminalController.extendsIntoTitlebar = hide
++        }
++        contentView?.needsLayout = true
++    }
++
++    // While the bar is hidden the whole window is content, as with the hidden titlebar style.
++    override var contentLayoutRect: CGRect {
++        guard singleTabChromeHidden, !styleMask.contains(.fullScreen) else {
++            return super.contentLayoutRect
++        }
++        var rect = super.contentLayoutRect
++        rect.origin.y = 0
++        rect.size.height = frame.height
++        return rect
+     }
+ 
+     // MARK: Tab Bar Setup
