@@ -79,12 +79,13 @@ swap() {
 
 # A new signature means macOS asks again for the permissions the old Ghostty had.
 permissions() {
-  echo "Re-grant Ghostty in each pane (remove the old Ghostty entry with -, add /Applications/Ghostty.app with +):"
+  echo "Re-grant Ghostty in each pane: remove any old Ghostty entry with -, then drag /Applications/Ghostty.app"
+  echo "from Finder into the list (the official backup also shows as \"Ghostty\" in the + picker):"
   echo "  Accessibility  - needed for the global hotkey (cmd+shift+space quick terminal)"
   echo "  Full Disk Access"
   echo "  Screen & System Audio Recording"
   for pane in Privacy_Accessibility Privacy_AllFiles Privacy_ScreenCapture; do
-    /usr/bin/open "x-apple.systempreferences:com.apple.preference.security?$pane"; sleep 1
+    /usr/bin/open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?$pane"; sleep 1
   done
 }
 
