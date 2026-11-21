@@ -81,9 +81,17 @@ jobs:
         with:
           version: ${{ steps.zig.outputs.version }}
 
+      # pandoc generates the man pages and HTML docs that the official app ships.
+      - name: Install pandoc
+        run: brew install pandoc
+
       - name: Build GhosttyKit
         working-directory: ghostty
-        run: zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Dversion-string=${TAG#v}
+        run: zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Demit-docs=true -Dversion-string=${TAG#v}
+
+      - name: Check the docs were built
+        working-directory: ghostty
+        run: test -f zig-out/share/man/man1/ghostty.1 && test -f zig-out/share/man/man5/ghostty.5
 
       - name: Build Ghostty.app
         working-directory: ghostty/macos

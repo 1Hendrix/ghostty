@@ -1,10 +1,12 @@
 #!/bin/bash
 # ghostty-fork-update: install the patched Ghostty (single-tab-bar) from github.com/1Hendrix/ghostty
 #
-#   ghostty-fork-update              newest release of the fork
-#   ghostty-fork-update --tag TAG    a specific fork release, e.g. v1.4.0-single-tab-bar
-#   ghostty-fork-update --run ID     the build artifact of one GitHub Actions run
-#   ghostty-fork-update --permissions   open the macOS permission panes to re-grant Ghostty
+#   ghostty-fork-update                 newest release of the fork (skipped if already installed)
+#   ghostty-fork-update --force         reinstall even if that release is already installed
+#   ghostty-fork-update --tag TAG       a specific fork release, e.g. v1.4.0-single-tab-bar
+#   ghostty-fork-update --run ID        the build artifact of one GitHub Actions run
+#   ghostty-fork-update --permissions   open the macOS permission panes (only needed after
+#                                       a switch from the official app or a new certificate)
 #
 # Downloads the build, signs it with "Ghostty Fork Signing (1Hendrix)" from the login
 # keychain, and stages it. The swap into /Applications/Ghostty.app happens by itself as
@@ -21,12 +23,15 @@ ENTITLEMENTS="$HOME/.config/ghostty-fork/Ghostty.entitlements"
 WORK="$HOME/Library/Caches/ghostty-fork"
 STAGED="$WORK/staged/Ghostty.app"
 BACKUPS="$WORK/backups"
+LOCK="$WORK/swap.lock"
+STATE="$WORK/installed-release"
 LOG="$HOME/Library/Logs/ghostty-fork-update.log"
 APP="/Applications/Ghostty.app"
 BREW="/opt/homebrew/bin/brew"
 PB="/usr/libexec/PlistBuddy"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
+plist() { $PB -c "Print :$1" "$2/Contents/Info.plist" 2>/dev/null || true; }
 
 # pgrep misses the running Ghostty on this Mac; ps lists every process with its full path.
 # Read the whole list first: with pipefail, "ps | grep -q" reports failure when grep
@@ -37,22 +42,35 @@ ghostty_running() {
   grep -qxF "$APP/Contents/MacOS/ghostty" <<<"$procs"
 }
 
+# Pids of swappers waiting from an earlier run (same read-first rule as above).
+other_swappers() {
+  local procs
+  procs=$(/bin/ps -axo pid=,command=)
+  awk -v me="$$" '/ghostty-fork-update --swap/ && $1 != me {print $1}' <<<"$procs"
+}
+
 # ---------------------------------------------------------------- swap (detached)
 swap() {
+  # One swap at a time.
+  mkdir -p "$WORK"
+  if ! mkdir "$LOCK" 2>/dev/null; then log "swap: another swap is running, this one stops"; exit 0; fi
+  trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+
   log "swap: waiting for Ghostty to quit"
   for _ in $(seq 1 14400); do ghostty_running || break; sleep 3; done
   if ghostty_running; then log "swap: Ghostty still running after 12 h, giving up (staged build kept)"; exit 1; fi
   [ -d "$STAGED" ] || { log "swap: nothing staged"; exit 1; }
 
+  first_switch=0
   # Keep the replaced app as a zip, never as a second .app: copies with the same bundle id
   # confuse macOS (System Settings showed the backup's name on Ghostty's permissions).
   if [ -d "$APP" ]; then
     mkdir -p "$BACKUPS"
-    if [ "$($PB -c 'Print :GhosttyFork' "$APP/Contents/Info.plist" 2>/dev/null || true)" = "single-tab-bar" ]; then
+    if [ "$(plist GhosttyFork "$APP")" = "single-tab-bar" ]; then
       backup="$BACKUPS/Ghostty-previous.zip"
     else
-      ver=$($PB -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo unknown)
-      backup="$BACKUPS/Ghostty-official-$ver.zip"
+      first_switch=1
+      backup="$BACKUPS/Ghostty-official-$(plist CFBundleShortVersionString "$APP").zip"
     fi
     rm -f "$backup.tmp"
     ditto -c -k --keepParent "$APP" "$backup.tmp"
@@ -69,25 +87,36 @@ swap() {
   rm -rf "$APP"
   ditto "$STAGED" "$APP"
   rm -rf "$WORK/staged"
+  xattr -d com.apple.FinderInfo "$APP" 2>/dev/null || true
+  if codesign --verify --deep --strict "$APP" 2>/dev/null; then log "swap: signature verified"; else log "swap: WARNING signature does not verify"; fi
 
-  # The man pages and shell completions the cask used to link.
+  # The man pages and shell completions the cask used to link, where this build has them.
   R="$APP/Contents/Resources"
-  ln -sf "$R/man/man1/ghostty.1" /opt/homebrew/share/man/man1/ghostty.1 2>/dev/null || true
-  ln -sf "$R/man/man5/ghostty.5" /opt/homebrew/share/man/man5/ghostty.5 2>/dev/null || true
-  ln -sf "$R/zsh/site-functions/_ghostty" /opt/homebrew/share/zsh/site-functions/_ghostty 2>/dev/null || true
-  ln -sf "$R/bash-completion/completions/ghostty.bash" /opt/homebrew/etc/bash_completion.d/ghostty 2>/dev/null || true
-  ln -sf "$R/fish/vendor_completions.d/ghostty.fish" /opt/homebrew/share/fish/vendor_completions.d/ghostty.fish 2>/dev/null || true
+  link() { [ -e "$1" ] || return 0; mkdir -p "$(dirname "$2")"; ln -sf "$1" "$2"; }
+  link "$R/man/man1/ghostty.1" /opt/homebrew/share/man/man1/ghostty.1
+  link "$R/man/man5/ghostty.5" /opt/homebrew/share/man/man5/ghostty.5
+  link "$R/zsh/site-functions/_ghostty" /opt/homebrew/share/zsh/site-functions/_ghostty
+  link "$R/bash-completion/completions/ghostty.bash" /opt/homebrew/etc/bash_completion.d/ghostty
+  link "$R/fish/vendor_completions.d/ghostty.fish" /opt/homebrew/share/fish/vendor_completions.d/ghostty.fish
 
-  log "swap: installed $($PB -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+  plist GhosttyForkRelease "$APP" > "$STATE"
+  ver="$(plist CFBundleShortVersionString "$APP") ($(cat "$STATE"))"
+  log "swap: installed $ver"
   # Open with a clean environment so nothing from the calling shell leaks into Ghostty.
   env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/open -a "$APP"
-  /usr/bin/osascript -e 'display notification "Patched Ghostty is installed. Run ghostty-fork-update --permissions once." with title "Ghostty"' >/dev/null 2>&1 || true
+  if [ "$first_switch" = 1 ]; then
+    msg="Patched Ghostty is installed. Run ghostty-fork-update --permissions once."
+  else
+    msg="Ghostty $ver is installed."
+  fi
+  /usr/bin/osascript -e "display notification \"$msg\" with title \"Ghostty\"" >/dev/null 2>&1 || true
 }
 
-# A new signature means macOS asks again for the permissions the old Ghostty had.
+# Only needed when the signature changes (switch from the official app, new certificate):
+# macOS ties Ghostty's permissions to the signing certificate.
 permissions() {
-  echo "Re-grant Ghostty in each pane: remove any old Ghostty entry with -, then drag /Applications/Ghostty.app"
-  echo "from Finder into the list (the official backup also shows as \"Ghostty\" in the + picker):"
+  echo "In each pane: remove any old Ghostty entry with -, then drag /Applications/Ghostty.app"
+  echo "from Finder into the list and switch it on. Then quit and reopen Ghostty."
   echo "  Accessibility  - needed for the global hotkey (cmd+shift+space quick terminal)"
   echo "  Full Disk Access"
   echo "  Screen & System Audio Recording"
@@ -96,44 +125,64 @@ permissions() {
   done
 }
 
-if [ "${1:-}" = "--swap" ]; then swap; exit 0; fi
-if [ "${1:-}" = "--permissions" ]; then permissions; exit 0; fi
+case "${1:-}" in
+  --swap) swap; exit 0;;
+  --permissions) permissions; exit 0;;
+esac
 
 # ---------------------------------------------------------------- fetch + sign + stage
-mode="release"; ref=""
-case "${1:-}" in
-  --run) mode="run"; ref="${2:?run id}";;
-  --tag) ref="${2:?tag}";;
-  "") ;;
-  *) sed -n '2,14p' "$0"; exit 2;;
-esac
+mode="release"; ref=""; force=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) mode="run"; ref="${2:?run id}"; shift 2;;
+    --tag) ref="${2:?tag}"; shift 2;;
+    --force) force=1; shift;;
+    *) sed -n '2,16p' "$0"; exit 2;;
+  esac
+done
 
 security find-identity -v -p codesigning | grep -q "$IDENTITY" || { echo "signing identity '$IDENTITY' missing from the login keychain"; exit 1; }
 [ -f "$ENTITLEMENTS" ] || { echo "missing $ENTITLEMENTS"; exit 1; }
+
+if [ "$mode" = "release" ]; then
+  release=$(gh release view ${ref:+"$ref"} -R "$REPO" --json tagName --jq .tagName)
+  installed=$(cat "$STATE" 2>/dev/null || true)
+  if [ "$release" = "$installed" ] && [ "$force" = 0 ]; then
+    echo "Already installed: $release. Nothing to do (--force reinstalls it)."
+    exit 0
+  fi
+else
+  release="run-$ref"
+fi
 
 case "$WORK" in "$HOME"/Library/Caches/ghostty-fork) ;; *) echo "bad WORK"; exit 1;; esac
 rm -rf "$WORK/dl"; mkdir -p "$WORK/dl" "$WORK/staged"
 if [ "$mode" = "run" ]; then
   gh run download "$ref" -R "$REPO" -n "$ARTIFACT" -D "$WORK/dl"
-  log "fetch: run $ref"
 else
-  gh release download ${ref:+"$ref"} -R "$REPO" -p '*.zip' -D "$WORK/dl"
-  log "fetch: release ${ref:-latest}"
+  gh release download "$release" -R "$REPO" -p '*.zip' -D "$WORK/dl"
 fi
+log "fetch: $release"
 zip=$(ls "$WORK/dl"/*.zip | head -1)
 ditto -x -k "$zip" "$WORK/dl"
 A="$WORK/dl/Ghostty.app"; P="$A/Contents/Info.plist"
 [ -d "$A" ] || { echo "no Ghostty.app in the download"; exit 1; }
 
-# No Sparkle updates from upstream: they would put the unpatched app back.
+# No updates from upstream's built-in updater: they would put the unpatched app back.
+# Without SUPublicEDKey Sparkle cannot verify, and so cannot install, any update.
 $PB -c "Delete :SUFeedURL" "$P" 2>/dev/null || true
+$PB -c "Delete :SUPublicEDKey" "$P" 2>/dev/null || true
 $PB -c "Set :SUEnableAutomaticChecks false" "$P" 2>/dev/null || $PB -c "Add :SUEnableAutomaticChecks bool false" "$P"
 $PB -c "Set :GhosttyFork single-tab-bar" "$P" 2>/dev/null || $PB -c "Add :GhosttyFork string single-tab-bar" "$P"
+$PB -c "Set :GhosttyForkRelease $release" "$P" 2>/dev/null || $PB -c "Add :GhosttyForkRelease string $release" "$P"
 # Xcode leaves the placeholder version 0.1; take the real one from the binary.
 if [ "$($PB -c 'Print :CFBundleShortVersionString' "$P")" = "0.1" ]; then
   v=$("$A/Contents/MacOS/ghostty" +version 2>/dev/null | awk '/^Ghostty /{print $2; exit}')
   [ -n "$v" ] && $PB -c "Set :CFBundleShortVersionString $v" "$P"
 fi
+
+# Finder metadata on the bundle fails strict signature checks.
+xattr -cr "$A" 2>/dev/null || true
 
 # Sign inside-out, like Ghostty's own release, with our stable identity.
 S="$A/Contents/Frameworks/Sparkle.framework/Versions/B"
@@ -147,19 +196,22 @@ codesign --force --sign "$IDENTITY" --entitlements "$ENTITLEMENTS" "$A" >/dev/nu
 codesign --verify --deep --strict "$A"
 log "sign: ok ($(codesign -dvv "$A" 2>&1 | grep -m1 Authority))"
 
+# Refuse to stage a build that cannot start.
 "$A/Contents/MacOS/ghostty" +version >/dev/null 2>&1 || { log "sign: signed app does not start"; exit 1; }
 rm -rf "$STAGED"; ditto "$A" "$STAGED"; rm -rf "$WORK/dl"
-log "stage: $($PB -c 'Print :CFBundleShortVersionString' "$STAGED/Contents/Info.plist") staged"
-
-# Refuse to stage a build that cannot start.
-"$STAGED/Contents/MacOS/ghostty" +version >/dev/null 2>&1 || { log "stage: staged app does not start"; rm -rf "$STAGED"; exit 1; }
+log "stage: $release staged"
 
 [ "${GHOSTTY_FORK_STAGE_ONLY:-}" = "1" ] && { echo "Staged only (no swap armed)."; exit 0; }
+
+# A newer run replaces a swapper that is still waiting from an earlier one.
+for pid in $(other_swappers); do kill "$pid" 2>/dev/null || true; done
+for _ in $(seq 1 20); do [ -z "$(other_swappers)" ] && break; sleep 0.5; done
+rmdir "$LOCK" 2>/dev/null || true
 
 # Detached swapper: survives this terminal and Ghostty quitting.
 /usr/bin/python3 -c 'import subprocess,sys; subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)' "$0" --swap
 if ghostty_running; then
-  echo "Staged. Quit Ghostty (⌘Q) when it suits you; the new version installs and reopens by itself."
+  echo "Staged $release. Quit Ghostty (⌘Q) when it suits you; it installs and reopens by itself."
 else
-  echo "Installing now."
+  echo "Installing $release now."
 fi
