@@ -35,6 +35,9 @@ protocol TerminalViewModel: ObservableObject {
 
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// The terminal should extend up into the (hidden) titlebar area.
+    var extendsIntoTitlebar: Bool { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -105,7 +108,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                                idealHeight: lastFocusedSurface?.value?.initialSize?.height)
                 }
                 // Ignore safe area to extend up in to the titlebar region if we have the "hidden" titlebar style
-                .ignoresSafeArea(.container, edges: ghostty.config.macosTitlebarStyle == .hidden ? .top : [])
+                .ignoresSafeArea(.container, edges: (ghostty.config.macosTitlebarStyle == .hidden || viewModel.extendsIntoTitlebar) ? .top : [])
 
                 if let surfaceView = lastFocusedSurface?.value {
                     TerminalCommandPaletteView(

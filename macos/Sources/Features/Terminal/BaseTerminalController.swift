@@ -56,6 +56,10 @@ class BaseTerminalController: NSWindowController,
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 
+    /// True while the window hides its titlebar because it holds a single tab
+    /// (fork patch: single-tab-bar). The terminal then extends into the titlebar area.
+    @Published var extendsIntoTitlebar: Bool = false
+
     /// Set if the terminal view should show the update overlay.
     @Published var updateOverlayIsVisible: Bool = false
 

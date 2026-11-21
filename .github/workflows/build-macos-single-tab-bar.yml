@@ -1,0 +1,50 @@
+# Fork-only build: Ghostty.app with the single-tab-bar patch, unsigned.
+# The app is signed locally on the Mac it runs on.
+name: Build macOS (single-tab-bar)
+
+on:
+  push:
+    branches: [single-tab-bar]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select the newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          X=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Using $X"
+          sudo xcode-select -s "$X"
+          xcodebuild -version
+
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Build GhosttyKit
+        run: zig build -Doptimize=ReleaseFast -Demit-macos-app=false -Dversion-string=1.4.0
+
+      - name: Build Ghostty.app
+        run: |
+          cd macos
+          xcodebuild -target Ghostty -configuration Release \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: Zip
+        run: |
+          cd macos/build/Release
+          ditto -c -k --keepParent Ghostty.app "$GITHUB_WORKSPACE/Ghostty-single-tab-bar.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ghostty-single-tab-bar
+          path: Ghostty-single-tab-bar.zip
+          retention-days: 30

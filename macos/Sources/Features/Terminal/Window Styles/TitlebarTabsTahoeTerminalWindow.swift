@@ -33,6 +33,7 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.viewModel.title = self.title
+                self.updateSingleTabChrome()
             }
         }
     }
@@ -50,10 +51,16 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         toolbar.centeredItemIdentifiers.insert(.title)
         self.toolbar = toolbar
         toolbarStyle = .unifiedCompact
+
+        // Fork patch (single-tab-bar): start without a bar; a second tab brings it back.
+        DispatchQueue.main.async { [weak self] in
+            self?.updateSingleTabChrome()
+        }
     }
     // Called after new tab finishes adjusting and setupTabBar is called in order to prevent Tab Bar hiding/size bug that occurs with some interactions with Mac UI
     override func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
         super.syncAppearance(surfaceConfig)
+        updateSingleTabChrome()
         DispatchQueue.main.async {
             // HACK: wait a tick before doing anything, to avoid edge cases during startup... :/
             // If we don't do this then on launch windows with restored state with tabs will end
@@ -64,6 +71,8 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
 
     override func becomeMain() {
         super.becomeMain()
+
+        updateSingleTabChrome()
 
         // Check if we have a tab bar and set it up if we have to. See the comment
         // on this function to learn why we need to check this here.
@@ -95,6 +104,10 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         // to put tab bar where we want again
         tabBarObserver = nil
 
+        // Fork patch (single-tab-bar): the tab bar lives in the toolbar, so the
+        // toolbar must be visible before the tab bar is set up.
+        updateSingleTabChrome(forceShow: true)
+
         // Some setup needs to happen BEFORE it is added, such as layout. If
         // we don't do this before the call below, we'll trigger an AppKit
         // assertion.
@@ -121,6 +134,54 @@ class TitlebarTabsTahoeTerminalWindow: TransparentTitlebarTerminalWindow, NSTool
         super.removeTitlebarAccessoryViewController(at: index)
 
         removeTabBar()
+
+        // Fork patch (single-tab-bar): back to one tab hides the bar again.
+        DispatchQueue.main.async { [weak self] in
+            self?.updateSingleTabChrome()
+        }
+    }
+
+    // MARK: Single Tab Bar (fork patch: single-tab-bar)
+
+    /// True while the toolbar and titlebar are hidden because this window is its only tab.
+    private var singleTabChromeHidden = false
+
+    /// A window with no tab group, or a tab group of one, is a single tab.
+    private var isSingleTab: Bool {
+        (tabGroup?.windows.count ?? 1) <= 1
+    }
+
+    /// Hide the toolbar and titlebar while this window is the only tab, and bring them back
+    /// once a second tab exists. Safe to call repeatedly.
+    func updateSingleTabChrome(forceShow: Bool = false) {
+        let hide = !forceShow && isSingleTab
+
+        guard hide != singleTabChromeHidden else {
+            // AppKit sometimes brings the titlebar back (title changes, fullscreen exit).
+            if hide, let titlebarContainer, !titlebarContainer.isHidden {
+                titlebarContainer.isHidden = true
+            }
+            return
+        }
+
+        singleTabChromeHidden = hide
+        willChangeValue(forKey: "contentLayoutRect")
+        toolbar?.isVisible = !hide
+        titlebarContainer?.isHidden = hide
+        didChangeValue(forKey: "contentLayoutRect")
+        terminalController?.extendsIntoTitlebar = hide
+        contentView?.needsLayout = true
+    }
+
+    // While the bar is hidden the whole window is content, as with the hidden titlebar style.
+    override var contentLayoutRect: CGRect {
+        guard singleTabChromeHidden, !styleMask.contains(.fullScreen) else {
+            return super.contentLayoutRect
+        }
+        var rect = super.contentLayoutRect
+        rect.origin.y = 0
+        rect.size.height = frame.height
+        return rect
     }
 
     // MARK: Tab Bar Setup
