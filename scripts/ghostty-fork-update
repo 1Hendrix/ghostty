@@ -9,8 +9,9 @@
 # Downloads the build, signs it with "Ghostty Fork Signing (1Hendrix)" from the login
 # keychain, and stages it. The swap into /Applications/Ghostty.app happens by itself as
 # soon as Ghostty is quit (right away if it isn't running), then Ghostty is reopened.
-# The app being replaced is kept: "Ghostty (official <version>).app" the first time,
-# "Ghostty (previous).app" after that. Log: ~/Library/Logs/ghostty-fork-update.log
+# The app being replaced is kept as a zip in ~/Library/Caches/ghostty-fork/backups/
+# (Ghostty-previous.zip, overwritten each update). Restore: quit Ghostty, unzip it to
+# /Applications and rename it Ghostty.app. Log: ~/Library/Logs/ghostty-fork-update.log
 set -euo pipefail
 
 REPO="1Hendrix/ghostty"
@@ -19,6 +20,7 @@ IDENTITY="Ghostty Fork Signing (1Hendrix)"
 ENTITLEMENTS="$HOME/.config/ghostty-fork/Ghostty.entitlements"
 WORK="$HOME/Library/Caches/ghostty-fork"
 STAGED="$WORK/staged/Ghostty.app"
+BACKUPS="$WORK/backups"
 LOG="$HOME/Library/Logs/ghostty-fork-update.log"
 APP="/Applications/Ghostty.app"
 BREW="/opt/homebrew/bin/brew"
@@ -42,15 +44,20 @@ swap() {
   if ghostty_running; then log "swap: Ghostty still running after 12 h, giving up (staged build kept)"; exit 1; fi
   [ -d "$STAGED" ] || { log "swap: nothing staged"; exit 1; }
 
+  # Keep the replaced app as a zip, never as a second .app: copies with the same bundle id
+  # confuse macOS (System Settings showed the backup's name on Ghostty's permissions).
   if [ -d "$APP" ]; then
+    mkdir -p "$BACKUPS"
     if [ "$($PB -c 'Print :GhosttyFork' "$APP/Contents/Info.plist" 2>/dev/null || true)" = "single-tab-bar" ]; then
-      backup="/Applications/Ghostty (previous).app"
+      backup="$BACKUPS/Ghostty-previous.zip"
     else
       ver=$($PB -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist" 2>/dev/null || echo unknown)
-      backup="/Applications/Ghostty (official $ver).app"
+      backup="$BACKUPS/Ghostty-official-$ver.zip"
     fi
-    rm -rf "$backup"
-    ditto "$APP" "$backup"
+    rm -f "$backup.tmp"
+    ditto -c -k --keepParent "$APP" "$backup.tmp"
+    unzip -tq "$backup.tmp" >/dev/null || { log "swap: backup zip failed its test, nothing replaced"; rm -f "$backup.tmp"; exit 1; }
+    mv -f "$backup.tmp" "$backup"
     log "swap: kept the old app as $backup"
   fi
 
